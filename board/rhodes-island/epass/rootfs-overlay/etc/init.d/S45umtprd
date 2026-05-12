@@ -1,0 +1,265 @@
+#!/bin/sh
+
+DAEMON="umtprd"
+PIDFILE="/var/run/$DAEMON.pid"
+CONFIG="/etc/umtprd/umtprd.conf"
+LOGFILE="/var/log/umtprd.log"
+GADGET="epass-mtp"
+GADGET_DIR="/sys/kernel/config/usb_gadget/$GADGET"
+FUNCTION="ffs.mtp"
+FUNCTION_DIR="$GADGET_DIR/functions/$FUNCTION"
+FUNCTION_LINK="$GADGET_DIR/configs/c.1/$FUNCTION"
+OS_DESC_LINK="$GADGET_DIR/os_desc/c.1"
+FFS_DIR="/dev/ffs-mtp"
+
+config_get_quoted() {
+	key="$1"
+	sed -n "s/^[[:space:]]*$key[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$CONFIG" | sed -n '1p'
+}
+
+config_get_word() {
+	key="$1"
+	sed -n "s/^[[:space:]]*$key[[:space:]]*\([^[:space:]#]*\).*/\1/p" "$CONFIG" | sed -n '1p'
+}
+
+load_config() {
+	MTP_STORAGE="$(config_get_quoted storage)"
+	USB_MANUFACTURER="$(config_get_quoted manufacturer)"
+	USB_PRODUCT="$(config_get_quoted product)"
+	USB_SERIAL="$(config_get_quoted serial)"
+	USB_CONFIGURATION="$(config_get_quoted interface)"
+	USB_VENDOR_ID="$(config_get_word usb_vendor_id)"
+	USB_PRODUCT_ID="$(config_get_word usb_product_id)"
+	USB_DEV_VERSION="$(config_get_word usb_dev_version)"
+
+	: "${MTP_STORAGE:=/media}"
+	: "${USB_MANUFACTURER:=Rhodes Island}"
+	: "${USB_PRODUCT:=ePass}"
+	: "${USB_SERIAL:=ePass001}"
+	: "${USB_CONFIGURATION:=MTP}"
+	: "${USB_VENDOR_ID:=0x1d6b}"
+	: "${USB_PRODUCT_ID:=0x0200}"
+	: "${USB_DEV_VERSION:=0x0101}"
+}
+
+mountpoint_is_mounted() {
+	mountpoint -q "$1" 2>/dev/null
+}
+
+mount_configfs() {
+	if ! mountpoint_is_mounted /sys/kernel/config; then
+		mount -t configfs none /sys/kernel/config
+	fi
+}
+
+mount_functionfs() {
+	mkdir -p "$FFS_DIR"
+	if ! mountpoint_is_mounted "$FFS_DIR"; then
+		mount -t functionfs mtp "$FFS_DIR"
+	fi
+}
+
+umount_functionfs() {
+	if mountpoint_is_mounted "$FFS_DIR"; then
+		umount "$FFS_DIR" 2>/dev/null || true
+	fi
+}
+
+wait_functionfs_ready() {
+	timeout=100
+
+	while [ "$timeout" -gt 0 ]; do
+		if [ -r "$FUNCTION_DIR/ready" ] && [ "$(cat "$FUNCTION_DIR/ready" 2>/dev/null)" = "1" ]; then
+			return 0
+		fi
+
+		if [ -e "$FFS_DIR/ep1" ] && [ -e "$FFS_DIR/ep2" ] && [ -e "$FFS_DIR/ep3" ]; then
+			return 0
+		fi
+
+		usleep 100000
+		timeout=$((timeout - 1))
+	done
+
+	echo "FunctionFS endpoints not ready"
+	return 1
+}
+
+link_function() {
+	cd "$GADGET_DIR"
+	if [ ! -e "$FUNCTION_LINK" ] && [ ! -L "$FUNCTION_LINK" ]; then
+		ln -s "functions/$FUNCTION" "$FUNCTION_LINK"
+	fi
+}
+
+configure_os_desc() {
+	cd "$GADGET_DIR"
+	echo 1 > os_desc/use
+	echo 0xcd > os_desc/b_vendor_code
+	echo "MSFT100" > os_desc/qw_sign
+
+	if [ ! -e "$OS_DESC_LINK" ] && [ ! -L "$OS_DESC_LINK" ]; then
+		ln -s configs/c.1 os_desc
+	fi
+}
+
+first_udc() {
+	set -- /sys/class/udc/*
+	if [ -e "$1" ]; then
+		basename "$1"
+	fi
+}
+
+wait_udc() {
+	timeout=50
+
+	while [ "$timeout" -gt 0 ]; do
+		udc="$(first_udc)"
+		if [ -n "$udc" ]; then
+			echo "$udc"
+			return 0
+		fi
+
+		usleep 100000
+		timeout=$((timeout - 1))
+	done
+
+	return 1
+}
+
+create_gadget() {
+	load_config
+	mount_configfs
+	mkdir -p "$MTP_STORAGE"
+	mkdir -p "$GADGET_DIR"
+
+	cd "$GADGET_DIR"
+	echo "$USB_VENDOR_ID" > idVendor
+	echo "$USB_PRODUCT_ID" > idProduct
+	echo 0x0200 > bcdUSB
+	echo "$USB_DEV_VERSION" > bcdDevice
+
+	mkdir -p strings/0x409
+	echo "$USB_SERIAL" > strings/0x409/serialnumber
+	echo "$USB_MANUFACTURER" > strings/0x409/manufacturer
+	echo "$USB_PRODUCT" > strings/0x409/product
+
+	mkdir -p configs/c.1/strings/0x409
+	echo "$USB_CONFIGURATION" > configs/c.1/strings/0x409/configuration
+	echo 500 > configs/c.1/MaxPower
+	configure_os_desc
+
+	mkdir -p "$FUNCTION_DIR"
+	mount_functionfs
+}
+
+bind_gadget() {
+	udc="$(wait_udc)"
+	if [ -z "$udc" ]; then
+		echo "no UDC found"
+		return 1
+	fi
+
+	cd "$GADGET_DIR"
+	if [ -z "$(cat UDC)" ]; then
+		echo "$udc" > UDC
+	fi
+}
+
+unbind_gadget() {
+	if [ -d "$GADGET_DIR" ]; then
+		cd "$GADGET_DIR"
+		if [ -n "$(cat UDC)" ]; then
+			echo "" > UDC
+		fi
+	fi
+}
+
+remove_gadget() {
+	if [ ! -d "$GADGET_DIR" ]; then
+		return 0
+	fi
+
+	[ ! -L "$OS_DESC_LINK" ] || rm -f "$OS_DESC_LINK"
+	[ ! -L "$FUNCTION_LINK" ] || rm -f "$FUNCTION_LINK"
+	rmdir "$FUNCTION_DIR" 2>/dev/null || true
+	rmdir "$GADGET_DIR/configs/c.1/strings/0x409" 2>/dev/null || true
+	rmdir "$GADGET_DIR/configs/c.1" 2>/dev/null || true
+	rmdir "$GADGET_DIR/strings/0x409" 2>/dev/null || true
+	rmdir "$GADGET_DIR" 2>/dev/null || true
+}
+
+start() {
+	printf 'Starting %s: ' "$DAEMON"
+	create_gadget || {
+		echo "FAIL"
+		return 1
+	}
+
+	mkdir -p "$(dirname "$LOGFILE")"
+	: > "$LOGFILE"
+	start-stop-daemon --start --background --make-pidfile \
+		--pidfile "$PIDFILE" --output "$LOGFILE" --exec "/usr/sbin/$DAEMON" \
+		-- -conf "$CONFIG"
+	status=$?
+	if [ "$status" -ne 0 ]; then
+		stop >/dev/null 2>&1 || true
+		echo "FAIL"
+		return "$status"
+	fi
+
+	wait_functionfs_ready || {
+		stop >/dev/null 2>&1 || true
+		echo "FAIL"
+		return 1
+	}
+
+	link_function || {
+		stop >/dev/null 2>&1 || true
+		echo "FAIL"
+		return 1
+	}
+
+	bind_gadget || {
+		stop >/dev/null 2>&1 || true
+		echo "FAIL"
+		return 1
+	}
+
+	echo "OK"
+	return 0
+}
+
+stop() {
+	printf 'Stopping %s: ' "$DAEMON"
+	unbind_gadget
+	start-stop-daemon --stop --quiet --pidfile "$PIDFILE" --exec "/usr/sbin/$DAEMON"
+	status=$?
+	rm -f "$PIDFILE"
+	umount_functionfs
+	remove_gadget
+
+	if [ "$status" -eq 0 ] || [ "$status" -eq 1 ]; then
+		echo "OK"
+		return 0
+	else
+		echo "FAIL"
+		return "$status"
+	fi
+}
+
+restart() {
+	stop
+	sleep 1
+	start
+}
+
+case "$1" in
+	start|stop|restart)
+		"$1";;
+	reload)
+		restart;;
+	*)
+		echo "Usage: $0 {start|stop|restart|reload}"
+		exit 1
+esac
