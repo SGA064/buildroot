@@ -45,8 +45,8 @@ usage()
 {
 	cat <<EOF
 Usage:
-  epass-flash.sh [options] -k zImage -u rootfs.ubi
-  epass-flash.sh [options] -B u-boot-sunxi-with-spl.bin -k zImage -u rootfs.ubi
+  epass-flash.sh [options] -k fitImage.itb -u rootfs.ubi
+  epass-flash.sh [options] -B u-boot-sunxi-with-spl.bin -k fitImage.itb -u rootfs.ubi
 
 Options:
   -b FILE     Combined U-Boot image used only to boot temporary DFU over FEL.
@@ -86,9 +86,9 @@ Environment:
 Examples:
   epass-flash.sh -l
   epass-flash.sh -B u-boot-sunxi-with-spl.bin
-  epass-flash.sh -k zImage -u rootfs.ubi
-  epass-flash.sh -B u-boot-sunxi-with-spl.bin -k zImage -u rootfs.ubi
-  epass-flash.sh -F -V -k zImage
+  epass-flash.sh -k fitImage.itb -u rootfs.ubi
+  epass-flash.sh -B u-boot-sunxi-with-spl.bin -k fitImage.itb -u rootfs.ubi
+  epass-flash.sh -F -V -k fitImage.itb
 EOF
 }
 

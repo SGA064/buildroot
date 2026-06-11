@@ -12,8 +12,8 @@ using the main branch.
 
 The Linux kernel is built with the in-tree epass_f1c200s_defconfig and
 the allwinner/suniv-f1c200s-epass device tree. Buildroot builds the
-kernel zImage and Linux DTB separately, then post-image.sh appends the
-DTB into the final output/images/zImage used for flashing.
+kernel zImage and Linux DTB separately, then post-image.sh packages them
+into the final output/images/fitImage.itb used for flashing.
 
 How to build it
 ===============
@@ -29,6 +29,7 @@ After building, the main files are available in output/images/:
   u-boot-sunxi-with-spl.bin
   zImage
   suniv-f1c200s-epass.dtb
+  fitImage.itb
   rootfs.ubi
   epass-flash.sh
 
@@ -39,7 +40,7 @@ Put the board in FEL mode and run:
 
   $ PATH=output/host/bin:$PATH output/images/epass-flash.sh \
       -B output/images/u-boot-sunxi-with-spl.bin \
-      -k output/images/zImage \
+      -k output/images/fitImage.itb \
       -u output/images/rootfs.ubi
 
 The U-Boot DFU layout matches the SPI-NAND partition map in the ePass
