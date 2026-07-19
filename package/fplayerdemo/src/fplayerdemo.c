@@ -15,6 +15,7 @@
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -61,11 +62,14 @@
 #define FILE_READAHEAD_BYTES (1024u * 1024u)
 #define FILE_KEEP_BEHIND_BYTES (512u * 1024u)
 #define FILE_DISCARD_STEP_BYTES (256u * 1024u)
+#define FILE_PREFETCH_LEAD_BYTES (2u * 1024u * 1024u)
 #define AV_PLAYBACK_START_DELAY_US 500000ULL
 #define USAGE_REPORT_INTERVAL_US 1000000ULL
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
+
+static volatile sig_atomic_t g_abort_requested;
 
 struct playlist {
 	char **items;
@@ -366,12 +370,14 @@ struct usage_report {
 struct submit_profile {
 	uint64_t request_us;
 	uint64_t controls_us;
+	uint64_t read_us;
 	uint64_t copy_us;
 	uint64_t queue_us;
 	uint64_t wait_us;
 	uint64_t dq_us;
 	uint64_t max_request_us;
 	uint64_t max_controls_us;
+	uint64_t max_read_us;
 	uint64_t max_copy_us;
 	uint64_t max_queue_us;
 	uint64_t max_wait_us;
@@ -540,32 +546,57 @@ static void usage_report_maybe(struct usage_report *report,
 	report->last_displayed = displayed;
 }
 
-static void sleep_until_us(uint64_t target_us)
+static bool playback_aborted(const struct options *opt)
+{
+	return g_abort_requested ||
+	       (opt->abort_playback &&
+		__atomic_load_n(opt->abort_playback, __ATOMIC_RELAXED));
+}
+
+static int sleep_until_us(uint64_t target_us, const struct options *opt)
 {
 	for (;;) {
 		uint64_t t = now_us();
 		uint64_t delta;
 
+		if (playback_aborted(opt))
+			return -ECANCELED;
 		if (t >= target_us)
-			return;
+			return 0;
 
 		delta = target_us - t;
-		if (delta > 20000)
-			delta = 20000;
+		if (delta > 100000)
+			delta = 100000;
 		usleep(delta);
 	}
-}
-
-static bool playback_aborted(const struct options *opt)
-{
-	return opt->abort_playback &&
-	       __atomic_load_n(opt->abort_playback, __ATOMIC_RELAXED);
 }
 
 static void playback_abort(int *abort_playback)
 {
 	if (abort_playback)
 		__atomic_store_n(abort_playback, 1, __ATOMIC_RELAXED);
+}
+
+static void handle_stop_signal(int sig)
+{
+	(void)sig;
+	g_abort_requested = 1;
+}
+
+static int install_signal_handlers(void)
+{
+	struct sigaction sa;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = handle_stop_signal;
+	sigemptyset(&sa.sa_mask);
+
+	if (sigaction(SIGINT, &sa, NULL) < 0)
+		return -1;
+	if (sigaction(SIGTERM, &sa, NULL) < 0)
+		return -1;
+
+	return 0;
 }
 
 static int audio_wait_for_playback_base(const struct options *opt)
@@ -1810,26 +1841,6 @@ static int map_file_ro(const char *path, uint8_t **data, size_t *size)
 	return 0;
 }
 
-static void warm_file_pages(const uint8_t *file, size_t size)
-{
-	volatile uint8_t sink = 0;
-	uint64_t start = now_us();
-	size_t page = 4096;
-	size_t off;
-
-	madvise((void *)file, size, MADV_SEQUENTIAL);
-	madvise((void *)file, size, MADV_WILLNEED);
-
-	for (off = 0; off < size; off += page)
-		sink ^= file[off];
-	if (size)
-		sink ^= file[size - 1];
-
-	fprintf(stderr, "warm file pages size=%zu elapsed_us=%" PRIu64 "\n",
-		size, now_us() - start);
-	(void)sink;
-}
-
 static uint64_t readahead_file_window(const uint8_t *file, size_t file_size,
 				      uint64_t offset, size_t window)
 {
@@ -1888,6 +1899,268 @@ static uint64_t discard_file_window(const uint8_t *file, size_t file_size,
 	}
 
 	return end;
+}
+
+/*
+ * Sliding readahead/discard window over an mmap'd input file. It keeps the
+ * pages around the current read offset resident and drops pages far behind so
+ * that playing large files on a CMA-constrained target does not thrash the
+ * page cache. Only meaningful for the direct-mmap path; the ffmpeg demux path
+ * copies each sample to the heap and leaves the window disabled (enabled=false).
+ */
+struct file_window {
+	const uint8_t *file;
+	size_t file_size;
+	uint64_t readahead_end;
+	uint64_t discard_end;
+	bool enabled;
+	bool allow_discard;
+};
+
+static void file_window_init(struct file_window *win, const uint8_t *file,
+			     size_t file_size, bool enabled, bool allow_discard)
+{
+	memset(win, 0, sizeof(*win));
+	win->file = file;
+	win->file_size = file_size;
+	win->enabled = enabled;
+	win->allow_discard = allow_discard;
+}
+
+/*
+ * Rewind the window bookkeeping without touching page residency. Used when a
+ * seamless loop restarts scanning from offset 0 so the next advance re-arms
+ * readahead from the top of the file.
+ */
+static void file_window_reset(struct file_window *win)
+{
+	win->readahead_end = 0;
+	win->discard_end = 0;
+}
+
+static void file_window_advance(struct file_window *win, uint64_t offset)
+{
+	if (!win->enabled)
+		return;
+
+	/*
+	 * Keep FILE_READAHEAD_BYTES resident ahead of the read cursor, but only
+	 * re-issue the madvise once the cursor has consumed a whole
+	 * FILE_DISCARD_STEP_BYTES chunk of the advised window. That throttles it
+	 * to roughly one syscall per step instead of one per sample while still
+	 * staying at least a step ahead of playback. Seamless loops call
+	 * file_window_reset() first, so a rewind re-arms from offset 0.
+	 */
+	if (offset + FILE_READAHEAD_BYTES >
+	    win->readahead_end + FILE_DISCARD_STEP_BYTES)
+		win->readahead_end = readahead_file_window(win->file,
+							   win->file_size,
+							   offset,
+							   FILE_READAHEAD_BYTES);
+
+	if (!win->allow_discard || offset <= FILE_KEEP_BEHIND_BYTES)
+		return;
+
+	/*
+	 * Drop pages that are more than FILE_KEEP_BEHIND_BYTES behind the read
+	 * cursor, advancing in FILE_DISCARD_STEP_BYTES chunks to avoid a
+	 * madvise syscall on every sample.
+	 */
+	{
+		uint64_t keep_from = offset - FILE_KEEP_BEHIND_BYTES;
+
+		if (keep_from >= win->discard_end + FILE_DISCARD_STEP_BYTES)
+			win->discard_end = discard_file_window(win->file,
+							       win->file_size,
+							       win->discard_end,
+							       keep_from);
+	}
+}
+
+/*
+ * Background prefetch thread. On this target MADV_WILLNEED is advisory and the
+ * block driver ignores it, so the decode thread otherwise faults each slice in
+ * synchronously (~6.4ms/frame measured, hidden behind nothing). This thread
+ * walks the mmap'd file ahead of the decode cursor and physically touches each
+ * page so it is resident in the page cache by the time the decode thread's
+ * memcpy reads it, overlapping storage IO with the hardware decode wait.
+ *
+ * This is a pure latency optimization: the decode thread always reads its own
+ * correct data from the mapping regardless of what the prefetcher has touched,
+ * so the cursor exchange only affects efficiency, never correctness.
+ * Only used on the direct-mmap path (the ffmpeg demux path holds samples on the
+ * heap, so there is nothing to fault in).
+ */
+struct file_prefetch {
+	const uint8_t *file;
+	size_t file_size;
+	pthread_t thread;
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	/*
+	 * cursor is guarded by lock. published is exchanged atomically for
+	 * diagnostics. This target is 32-bit ARMv5 with no native 64-bit atomics
+	 * (would need libatomic), so offsets stay uint32_t; file offsets on a
+	 * 32-bit mmap are < 4GB anyway.
+	 */
+	uint32_t cursor;	/* decode read offset */
+	uint32_t fetched;	/* offset the prefetcher has touched up to */
+	uint32_t published;	/* fetched, published atomically for diagnostics */
+	/* Diagnostics, written only by the decode thread in set_cursor(). */
+	uint64_t samples;	/* cursor publishes seen */
+	uint64_t covered;	/* publishes where prefetch was already ahead */
+	uint64_t lead_sum;	/* sum of (fetched - offset) when ahead */
+	int abort;
+	bool started;
+	bool sync_ready;
+};
+
+/*
+ * Publish the decode read offset and, for diagnostics, record whether the
+ * prefetcher had already touched past this offset (i.e. it is leading decode)
+ * and by how much. Called only from the decode thread, so the counters need no
+ * locking; it reads the prefetcher's published progress atomically.
+ */
+static void file_prefetch_set_cursor(struct file_prefetch *pf, uint32_t offset)
+{
+	uint32_t fetched = __atomic_load_n(&pf->published, __ATOMIC_RELAXED);
+
+	pf->samples++;
+	if (fetched > offset) {
+		pf->covered++;
+		pf->lead_sum += fetched - offset;
+	}
+
+	if (!pf->started)
+		return;
+
+	pthread_mutex_lock(&pf->lock);
+	pf->cursor = offset;
+	pthread_cond_signal(&pf->cond);
+	pthread_mutex_unlock(&pf->lock);
+}
+
+static uint32_t file_prefetch_target(const struct file_prefetch *pf,
+				     uint32_t cursor)
+{
+	uint32_t file_size = pf->file_size > UINT32_MAX ?
+			     UINT32_MAX : (uint32_t)pf->file_size;
+
+	if (cursor >= file_size)
+		return file_size;
+	if (file_size - cursor < FILE_PREFETCH_LEAD_BYTES)
+		return file_size;
+	return cursor + FILE_PREFETCH_LEAD_BYTES;
+}
+
+static void *file_prefetch_main(void *arg)
+{
+	struct file_prefetch *pf = arg;
+	long page = sysconf(_SC_PAGESIZE);
+	volatile uint8_t sink = 0;
+
+	set_thread_name("f1c-prefetch");
+	if (page <= 0)
+		page = 4096;
+
+	pthread_mutex_lock(&pf->lock);
+	while (!__atomic_load_n(&pf->abort, __ATOMIC_RELAXED)) {
+		uint32_t cursor = pf->cursor;
+		uint32_t target;
+		uint32_t start;
+		uint32_t off;
+
+		target = file_prefetch_target(pf, cursor);
+
+		/*
+		 * If the decode cursor jumped backwards (seamless loop restart)
+		 * rewind so we re-touch pages ahead of the new position.
+		 */
+		if (pf->fetched < cursor || pf->fetched > target)
+			pf->fetched = cursor - (cursor % (uint32_t)page);
+
+		if (pf->fetched >= target) {
+			pthread_cond_wait(&pf->cond, &pf->lock);
+			continue;
+		}
+
+		start = pf->fetched;
+		pthread_mutex_unlock(&pf->lock);
+		for (off = start; off < target &&
+		     !__atomic_load_n(&pf->abort, __ATOMIC_RELAXED);
+		     off += (uint32_t)page)
+			sink ^= pf->file[off];
+
+		pthread_mutex_lock(&pf->lock);
+		pf->fetched = target;
+		__atomic_store_n(&pf->published, pf->fetched, __ATOMIC_RELAXED);
+	}
+	pthread_mutex_unlock(&pf->lock);
+
+	(void)sink;
+	return NULL;
+}
+
+static void file_prefetch_start(struct file_prefetch *pf, const uint8_t *file,
+				size_t file_size, bool enabled)
+{
+	const char *disable = getenv("F1C_NO_PREFETCH");
+
+	memset(pf, 0, sizeof(*pf));
+	pf->file = file;
+	pf->file_size = file_size;
+
+	if (!enabled)
+		return;
+
+	/*
+	 * Escape hatch to A/B the prefetcher at runtime without a rebuild: set
+	 * F1C_NO_PREFETCH=1 to leave the mmap fault-in on the decode thread.
+	 */
+	if (disable && *disable && strcmp(disable, "0") != 0) {
+		fprintf(stderr, "prefetch disabled by F1C_NO_PREFETCH\n");
+		return;
+	}
+
+	if (pthread_mutex_init(&pf->lock, NULL)) {
+		fprintf(stderr, "prefetch mutex init failed\n");
+		return;
+	}
+	if (pthread_cond_init(&pf->cond, NULL)) {
+		fprintf(stderr, "prefetch cond init failed\n");
+		pthread_mutex_destroy(&pf->lock);
+		return;
+	}
+	pf->sync_ready = true;
+
+	int thread_ret = pthread_create(&pf->thread, NULL,
+					file_prefetch_main, pf);
+	if (thread_ret) {
+		fprintf(stderr, "prefetch thread start failed: %s\n",
+			strerror(thread_ret));
+		pthread_cond_destroy(&pf->cond);
+		pthread_mutex_destroy(&pf->lock);
+		pf->sync_ready = false;
+		return;
+	}
+	pf->started = true;
+}
+
+static void file_prefetch_stop(struct file_prefetch *pf)
+{
+	if (!pf->started)
+		return;
+	__atomic_store_n(&pf->abort, 1, __ATOMIC_RELAXED);
+	pthread_mutex_lock(&pf->lock);
+	pthread_cond_signal(&pf->cond);
+	pthread_mutex_unlock(&pf->lock);
+	pthread_join(pf->thread, NULL);
+	pf->started = false;
+	if (pf->sync_ready) {
+		pthread_cond_destroy(&pf->cond);
+		pthread_mutex_destroy(&pf->lock);
+		pf->sync_ready = false;
+	}
 }
 
 static bool atom_payload(const uint8_t *file, size_t file_size, uint64_t off,
@@ -2384,8 +2657,13 @@ static int parse_stsd(struct video_track *t, const uint8_t *file,
 			if (!atom_payload(file, entry_end, child, entry_end,
 					  &payload2, &end2, &type2))
 				return -1;
-			if (fourcc_is(type2, "avcC"))
-				return parse_avcc(t, file + payload2, end2 - payload2);
+			if (fourcc_is(type2, "avcC")) {
+				if (parse_avcc(t, file + payload2, end2 - payload2))
+					return -1;
+				t->codec = AV_CODEC_ID_H264;
+				t->ffmpeg_codec_id = AV_CODEC_ID_H264;
+				return 0;
+			}
 			child = end2;
 		}
 		off = entry_end;
@@ -2655,19 +2933,26 @@ static uint32_t sample_size(const struct video_track *t, uint32_t sample)
 					t->sample_sizes[sample];
 }
 
-static bool sample_is_sync(const struct video_track *t, uint32_t sample)
+/*
+ * Test whether a sample is a sync (key) frame while walking samples in
+ * ascending order. *cursor tracks the position in the ascending sync_samples
+ * table so the whole table is scanned once across all samples (O(n)) instead
+ * of a linear search per sample. Callers must invoke this with monotonically
+ * non-decreasing sample indices.
+ */
+static bool sample_is_sync(const struct video_track *t, uint32_t sample,
+			   uint32_t *cursor)
 {
 	uint32_t one_based = sample + 1;
-	uint32_t i;
 
 	if (!t->sync_count)
 		return true;
 
-	for (i = 0; i < t->sync_count; i++)
-		if (t->sync_samples[i] == one_based)
-			return true;
+	while (*cursor < t->sync_count && t->sync_samples[*cursor] < one_based)
+		(*cursor)++;
 
-	return false;
+	return *cursor < t->sync_count &&
+	       t->sync_samples[*cursor] == one_based;
 }
 
 static uint64_t ticks_to_us(uint64_t ticks, uint32_t timescale)
@@ -2699,6 +2984,7 @@ static int build_sample_table(struct video_track *t, size_t file_size)
 	int64_t ctts_offset = 0;
 	uint64_t dts = 0;
 	int64_t min_pts = INT64_MAX;
+	uint32_t sync_cursor = 0;
 
 	if (!t->sample_count || !t->stsc_count || !t->chunk_count ||
 	    (!t->default_sample_size && !t->sample_sizes))
@@ -2747,7 +3033,8 @@ static int build_sample_table(struct video_track *t, size_t file_size)
 			t->samples[sample].size = size;
 			t->samples[sample].duration = stts_left ? stts_delta : 0;
 			t->samples[sample].has_time = has_time;
-			t->samples[sample].sync = sample_is_sync(t, sample);
+			t->samples[sample].sync = sample_is_sync(t, sample,
+								 &sync_cursor);
 
 			if (has_time && pts < min_pts)
 				min_pts = pts;
@@ -3807,14 +4094,19 @@ static int ffmpeg_handle_audio_frame(AVCodecContext *ctx, AVFrame *frame,
 	if (pcm) {
 		uint64_t stage = now_us();
 
-		ret = ffmpeg_frame_to_s16(frame, frame_channels, s16_buf,
-					  s16_capacity, &frames);
-		profile_add_us(&stats->convert_us, &stats->max_convert_us,
-			       now_us() - stage);
-		if (ret)
-			return ret;
-		ret = write_pcm_all(pcm, *s16_buf, frames, frame_channels,
-				    stats, opt);
+		if (frame->format == AV_SAMPLE_FMT_S16 && frame->data[0]) {
+			ret = write_pcm_all(pcm, (const int16_t *)frame->data[0],
+					    frames, frame_channels, stats, opt);
+		} else {
+			ret = ffmpeg_frame_to_s16(frame, frame_channels, s16_buf,
+						  s16_capacity, &frames);
+			profile_add_us(&stats->convert_us, &stats->max_convert_us,
+				       now_us() - stage);
+			if (ret)
+				return ret;
+			ret = write_pcm_all(pcm, *s16_buf, frames,
+					    frame_channels, stats, opt);
+		}
 		if (ret < 0)
 			return ret;
 	}
@@ -3887,6 +4179,7 @@ static int play_aac_audio_ffmpeg(const uint8_t *file,
 	uint64_t start_us;
 	uint64_t elapsed_us;
 	bool benchmark = opt->no_pace;
+	bool packet_input_is_padded = !!audio->sample_data;
 	int ret = -1;
 
 	if (!audio->is_audio) {
@@ -3974,10 +4267,12 @@ static int play_aac_audio_ffmpeg(const uint8_t *file,
 		if (audio->samples[i].size > max_sample_size)
 			max_sample_size = audio->samples[i].size;
 	}
-	pkt_buf = av_malloc((size_t)max_sample_size +
-			    AV_INPUT_BUFFER_PADDING_SIZE);
-	if (!pkt_buf)
-		goto out;
+	if (!packet_input_is_padded) {
+		pkt_buf = av_malloc((size_t)max_sample_size +
+				    AV_INPUT_BUFFER_PADDING_SIZE);
+		if (!pkt_buf)
+			goto out;
+	}
 
 	ret = audio_wait_for_playback_base(opt);
 	if (ret)
@@ -3986,6 +4281,7 @@ static int play_aac_audio_ffmpeg(const uint8_t *file,
 
 	for (i = 0; i < limit; i++) {
 		const struct sample_info *s = &audio->samples[i];
+		const uint8_t *src = track_sample_data(file, audio, i);
 		uint64_t decode_elapsed = 0;
 
 		if (playback_aborted(opt)) {
@@ -3996,10 +4292,14 @@ static int play_aac_audio_ffmpeg(const uint8_t *file,
 		stats.samples++;
 		stats.input_bytes += s->size;
 
-		memcpy(pkt_buf, track_sample_data(file, audio, i), s->size);
-		memset(pkt_buf + s->size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 		av_packet_unref(pkt);
-		pkt->data = pkt_buf;
+		if (packet_input_is_padded) {
+			pkt->data = (uint8_t *)src;
+		} else {
+			memcpy(pkt_buf, src, s->size);
+			memset(pkt_buf + s->size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+			pkt->data = pkt_buf;
+		}
 		pkt->size = s->size;
 		pkt->pts = s->pts_us;
 		pkt->duration = s->duration;
@@ -4189,6 +4489,7 @@ struct lite_v4l2 {
 	uint32_t capture_count;
 	uint32_t output_size;
 	uint32_t capture_size;
+	int request_fd;
 	bool stream_output;
 	bool stream_capture;
 };
@@ -4692,6 +4993,59 @@ static void poc_type0_calc(const GstH264NalUnit *nalu,
 		*bottom_poc = msb + (int32_t)poc_lsb +
 			      slice->delta_pic_order_cnt_bottom;
 	*poc_msb = msb;
+}
+
+static void poc_type1_calc(const GstH264NalUnit *nalu,
+			   const GstH264SliceHdr *slice,
+			   const struct poc_state *state,
+			   int32_t *top_poc, int32_t *bottom_poc,
+			   uint32_t *frame_num_offset)
+{
+	const GstH264SPS *sps = slice->pps->sequence;
+	uint32_t num_cycle = sps->num_ref_frames_in_pic_order_cnt_cycle;
+	int32_t expected_delta_cycle = 0;
+	int32_t expected_poc;
+	uint32_t abs_frame_num;
+	unsigned int i;
+
+	/* H.264 8.2.1.2: derive FrameNumOffset like poc_type2_calc(). */
+	if (nalu->type == GST_H264_NAL_SLICE_IDR)
+		*frame_num_offset = 0;
+	else if (state->prev_frame_num > slice->frame_num)
+		*frame_num_offset = state->prev_frame_num_offset +
+				    sps->max_frame_num;
+	else
+		*frame_num_offset = state->prev_frame_num_offset;
+
+	if (num_cycle != 0)
+		abs_frame_num = *frame_num_offset + slice->frame_num;
+	else
+		abs_frame_num = 0;
+
+	if (!nalu->ref_idc && abs_frame_num > 0)
+		abs_frame_num -= 1;
+
+	for (i = 0; i < num_cycle; i++)
+		expected_delta_cycle += sps->offset_for_ref_frame[i];
+
+	if (abs_frame_num > 0) {
+		uint32_t cycle_cnt = (abs_frame_num - 1) / num_cycle;
+		uint32_t frame_in_cycle = (abs_frame_num - 1) % num_cycle;
+
+		expected_poc = (int32_t)cycle_cnt * expected_delta_cycle;
+		for (i = 0; i <= frame_in_cycle; i++)
+			expected_poc += sps->offset_for_ref_frame[i];
+	} else {
+		expected_poc = 0;
+	}
+
+	if (!nalu->ref_idc)
+		expected_poc += sps->offset_for_non_ref_pic;
+
+	/* Frame pictures only; field_pic_flag is rejected before POC calc. */
+	*top_poc = expected_poc + slice->delta_pic_order_cnt[0];
+	*bottom_poc = *top_poc + sps->offset_for_top_to_bottom_field +
+		      slice->delta_pic_order_cnt[1];
 }
 
 static void poc_type2_calc(const GstH264NalUnit *nalu,
@@ -5325,58 +5679,6 @@ static uint32_t max_sample_size(const struct video_track *t)
 	return max;
 }
 
-static void print_v4l2_capabilities(int fd)
-{
-	struct v4l2_capability cap = { 0 };
-	uint32_t caps;
-
-	if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
-		fprintf(stderr, "v4l2 QUERYCAP failed: %s\n", strerror(errno));
-		return;
-	}
-
-	caps = cap.device_caps ? cap.device_caps : cap.capabilities;
-	fprintf(stderr,
-		"v4l2 driver=%s card=%s bus=%s caps=0x%08x device_caps=0x%08x active=0x%08x\n",
-		cap.driver, cap.card, cap.bus_info, cap.capabilities,
-		cap.device_caps, caps);
-}
-
-static bool enum_v4l2_formats(int fd, enum v4l2_buf_type type,
-			      uint32_t want, const char *label)
-{
-	bool found = false;
-	uint32_t i;
-	char want_buf[5];
-
-	for (i = 0; ; i++) {
-		struct v4l2_fmtdesc desc = {
-			.index = i,
-			.type = type,
-		};
-		char fmt_buf[5];
-
-		if (xioctl(fd, VIDIOC_ENUM_FMT, &desc) < 0) {
-			if (errno != EINVAL)
-				fprintf(stderr, "v4l2 ENUM_FMT %s failed: %s\n",
-					label, strerror(errno));
-			break;
-		}
-
-		fprintf(stderr, "v4l2 %s fmt[%u]=%s (%s) flags=0x%x\n",
-			label, i, pixfmt_str(desc.pixelformat, fmt_buf),
-			desc.description, desc.flags);
-		if (desc.pixelformat == want)
-			found = true;
-	}
-
-	if (!found)
-		fprintf(stderr, "v4l2 %s missing required format %s\n",
-			label, pixfmt_str(want, want_buf));
-
-	return found;
-}
-
 static int set_v4l2_format(int fd, enum v4l2_buf_type type, uint32_t pixfmt,
 			   uint32_t width, uint32_t height, uint32_t sizeimage,
 			   struct v4l2_pix_format *applied,
@@ -5418,153 +5720,6 @@ static int set_v4l2_format(int fd, enum v4l2_buf_type type, uint32_t pixfmt,
 		*applied = fmt.fmt.pix;
 
 	return 0;
-}
-
-static int request_v4l2_buffers_probe(int fd, enum v4l2_buf_type type,
-				      uint32_t count, const char *label)
-{
-	struct v4l2_requestbuffers req = {
-		.count = count,
-		.type = type,
-		.memory = V4L2_MEMORY_MMAP,
-	};
-
-	if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
-		fprintf(stderr, "v4l2 REQBUFS %s count=%u failed: %s\n",
-			label, count, strerror(errno));
-		return -1;
-	}
-
-	fprintf(stderr, "v4l2 %s REQBUFS requested=%u got=%u caps=0x%x\n",
-		label, count, req.count, req.capabilities);
-
-	return req.count ? 0 : -1;
-}
-
-static void release_v4l2_buffers(int fd, enum v4l2_buf_type type,
-				 const char *label)
-{
-	struct v4l2_requestbuffers release = {
-		.count = 0,
-		.type = type,
-		.memory = V4L2_MEMORY_MMAP,
-	};
-
-	if (xioctl(fd, VIDIOC_REQBUFS, &release) < 0)
-		fprintf(stderr, "v4l2 REQBUFS %s release failed: %s\n",
-			label, strerror(errno));
-}
-
-static void probe_h264_controls(int fd)
-{
-	static const struct {
-		uint32_t id;
-		const char *name;
-		size_t expect;
-		bool optional;
-	} ctrls[] = {
-		{ V4L2_CID_STATELESS_H264_DECODE_MODE, "DECODE_MODE", 0, false },
-		{ V4L2_CID_STATELESS_H264_START_CODE, "START_CODE", 0, false },
-		{ V4L2_CID_STATELESS_H264_SPS, "SPS",
-		  sizeof(struct v4l2_ctrl_h264_sps), false },
-		{ V4L2_CID_STATELESS_H264_PPS, "PPS",
-		  sizeof(struct v4l2_ctrl_h264_pps), false },
-		{ V4L2_CID_STATELESS_H264_SCALING_MATRIX, "SCALING_MATRIX",
-		  sizeof(struct v4l2_ctrl_h264_scaling_matrix), true },
-		{ V4L2_CID_STATELESS_H264_DECODE_PARAMS, "DECODE_PARAMS",
-		  sizeof(struct v4l2_ctrl_h264_decode_params), false },
-		{ V4L2_CID_STATELESS_H264_SLICE_PARAMS, "SLICE_PARAMS",
-		  sizeof(struct v4l2_ctrl_h264_slice_params), false },
-		{ V4L2_CID_STATELESS_H264_PRED_WEIGHTS, "PRED_WEIGHTS",
-		  sizeof(struct v4l2_ctrl_h264_pred_weights), true },
-	};
-	struct v4l2_ext_control values[2] = {
-		{ .id = V4L2_CID_STATELESS_H264_DECODE_MODE },
-		{ .id = V4L2_CID_STATELESS_H264_START_CODE },
-	};
-	struct v4l2_ext_controls ext = {
-		.count = ARRAY_SIZE(values),
-		.controls = values,
-	};
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(ctrls); i++) {
-		struct v4l2_query_ext_ctrl q = {
-			.id = ctrls[i].id,
-		};
-		uint64_t bytes;
-
-		if (xioctl(fd, VIDIOC_QUERY_EXT_CTRL, &q) < 0) {
-			fprintf(stderr, "v4l2 ctrl %-14s missing%s: %s\n",
-				ctrls[i].name, ctrls[i].optional ? " optional" : "",
-				strerror(errno));
-			continue;
-		}
-
-		bytes = (uint64_t)q.elem_size * q.elems;
-		fprintf(stderr,
-			"v4l2 ctrl %-14s type=0x%x elem=%u elems=%u bytes=%" PRIu64 " expect=%zu flags=0x%x\n",
-			ctrls[i].name, q.type, q.elem_size, q.elems, bytes,
-			ctrls[i].expect, q.flags);
-	}
-
-	if (xioctl(fd, VIDIOC_G_EXT_CTRLS, &ext) == 0)
-		fprintf(stderr, "v4l2 h264 decode_mode=%d start_code=%d\n",
-			values[0].value, values[1].value);
-	else
-		fprintf(stderr, "v4l2 G_EXT_CTRLS decode mode/start code failed: %s\n",
-			strerror(errno));
-}
-
-static int probe_media_path(const char *path)
-{
-	struct media_device_info info = { 0 };
-	int media_fd, request_fd = -1;
-	int ret = -1;
-
-	media_fd = open(path, O_RDWR | O_CLOEXEC);
-	if (media_fd < 0)
-		return -1;
-
-	if (xioctl(media_fd, MEDIA_IOC_DEVICE_INFO, &info) == 0)
-		fprintf(stderr,
-			"media node=%s driver=%s model=%s bus=%s version=0x%x\n",
-			path, info.driver, info.model, info.bus_info,
-			info.media_version);
-	else
-		fprintf(stderr, "media node=%s DEVICE_INFO failed: %s\n",
-			path, strerror(errno));
-
-	if (xioctl(media_fd, MEDIA_IOC_REQUEST_ALLOC, &request_fd) < 0) {
-		fprintf(stderr, "media node=%s REQUEST_ALLOC failed: %s\n",
-			path, strerror(errno));
-		goto out;
-	}
-
-	fprintf(stderr, "media node=%s request_alloc fd=%d ok\n", path, request_fd);
-	close(request_fd);
-	ret = 0;
-out:
-	close(media_fd);
-	return ret;
-}
-
-static int probe_media_request(const char *forced)
-{
-	char path[32];
-	unsigned int i;
-
-	if (forced)
-		return probe_media_path(forced);
-
-	for (i = 0; i < 8; i++) {
-		snprintf(path, sizeof(path), "/dev/media%u", i);
-		if (probe_media_path(path) == 0)
-			return 0;
-	}
-
-	fprintf(stderr, "media request probe failed on /dev/media0..7\n");
-	return -1;
 }
 
 static int open_media_path(const char *path, bool verbose)
@@ -5772,6 +5927,9 @@ static void lite_v4l2_close(struct lite_v4l2 *dec)
 		close(dec->video_fd);
 	}
 
+	if (dec->request_fd >= 0)
+		close(dec->request_fd);
+
 	if (dec->media_fd >= 0)
 		close(dec->media_fd);
 }
@@ -5788,6 +5946,7 @@ static int lite_v4l2_setup(struct lite_v4l2 *dec, const struct options *opt,
 	memset(dec, 0, sizeof(*dec));
 	dec->video_fd = -1;
 	dec->media_fd = -1;
+	dec->request_fd = -1;
 	dec->output_size = max_sample_size(track);
 	if (dec->output_size < H264_OUTPUT_SIZE_MIN)
 		dec->output_size = H264_OUTPUT_SIZE_MIN;
@@ -5873,6 +6032,7 @@ fail:
 	memset(dec, 0, sizeof(*dec));
 	dec->video_fd = -1;
 	dec->media_fd = -1;
+	dec->request_fd = -1;
 	return -1;
 }
 
@@ -6202,7 +6362,6 @@ static int display_queue_show_one(struct display_queue *q,
 				  const struct options *opt)
 {
 	struct display_frame frame;
-	uint32_t queued;
 	uint64_t stage;
 	uint64_t t;
 	int idx;
@@ -6210,7 +6369,6 @@ static int display_queue_show_one(struct display_queue *q,
 	if (!q->count)
 		return 0;
 
-	queued = q->count;
 	idx = display_queue_lowest(q);
 	if (idx < 0)
 		return -1;
@@ -6232,7 +6390,10 @@ static int display_queue_show_one(struct display_queue *q,
 			target_us = kms->base_us +
 				    (uint64_t)kms->frames * kms->delay_ms * 1000;
 		stage = opt->profile ? now_us() : 0;
-		sleep_until_us(target_us);
+		if (sleep_until_us(target_us, opt)) {
+			capture_put(dec, frame.capture_index);
+			return -ECANCELED;
+		}
 		if (opt->profile)
 			profile_add_us(&kms->sleep_us, &kms->max_sleep_us,
 				       now_us() - stage);
@@ -6397,7 +6558,7 @@ static int lite_v4l2_submit_slice(struct lite_v4l2 *dec,
 		.bytesused = dec->capture[capture_index].length,
 	};
 	struct pollfd pfd;
-	int request_fd = -1;
+	int request_fd;
 	int ret = -1;
 	uint64_t stage = 0;
 
@@ -6411,13 +6572,30 @@ static int lite_v4l2_submit_slice(struct lite_v4l2 *dec,
 		return -1;
 	}
 
+	/*
+	 * Allocate the media request fd once and reuse it for every frame via
+	 * MEDIA_REQUEST_IOC_REINIT, saving an alloc+close syscall pair per
+	 * frame. The fd is closed in lite_v4l2_close(). A failed request is
+	 * closed below so the next call re-allocates from a clean state.
+	 */
 	if (profile)
 		stage = now_us();
-	if (xioctl(dec->media_fd, MEDIA_IOC_REQUEST_ALLOC, &request_fd) < 0) {
-		fprintf(stderr, "MEDIA_IOC_REQUEST_ALLOC failed: %s\n",
+	if (dec->request_fd < 0) {
+		if (xioctl(dec->media_fd, MEDIA_IOC_REQUEST_ALLOC,
+			   &dec->request_fd) < 0) {
+			fprintf(stderr, "MEDIA_IOC_REQUEST_ALLOC failed: %s\n",
+				strerror(errno));
+			return -1;
+		}
+	} else if (xioctl(dec->request_fd, MEDIA_REQUEST_IOC_REINIT,
+			  NULL) < 0) {
+		fprintf(stderr, "MEDIA_REQUEST_IOC_REINIT failed: %s\n",
 			strerror(errno));
+		close(dec->request_fd);
+		dec->request_fd = -1;
 		return -1;
 	}
+	request_fd = dec->request_fd;
 	if (profile)
 		profile_add_us(&profile->request_us, &profile->max_request_us,
 			       now_us() - stage);
@@ -6432,6 +6610,28 @@ static int lite_v4l2_submit_slice(struct lite_v4l2 *dec,
 	if (profile)
 		profile_add_us(&profile->controls_us, &profile->max_controls_us,
 			       now_us() - stage);
+
+	/*
+	 * Split the copy cost into read side vs write side. The read side faults
+	 * in / reads the mmap'd source slice (a volatile sink keeps the compiler
+	 * from eliding it); the subsequent memcpy then measures mostly the store
+	 * into the V4L2 output buffer, which on sunxi is uncached/write-combine
+	 * CMA. This tells us whether the ~6.6ms/frame copy is source fault-in or
+	 * the destination write.
+	 */
+	if (profile) {
+		volatile uint8_t sink = 0;
+		uint32_t i;
+
+		stage = now_us();
+		for (i = 0; i < slice_size; i += 4096)
+			sink ^= slice_data[i];
+		if (slice_size)
+			sink ^= slice_data[slice_size - 1];
+		(void)sink;
+		profile_add_us(&profile->read_us, &profile->max_read_us,
+			       now_us() - stage);
+	}
 
 	if (profile)
 		stage = now_us();
@@ -6505,8 +6705,15 @@ static int lite_v4l2_submit_slice(struct lite_v4l2 *dec,
 
 	ret = 0;
 out:
-	if (request_fd >= 0)
-		close(request_fd);
+	/*
+	 * On failure the request fd may be left half-queued; drop it so the next
+	 * frame re-allocates a clean one. On success it is kept for reuse and
+	 * closed in lite_v4l2_close().
+	 */
+	if (ret && dec->request_fd >= 0) {
+		close(dec->request_fd);
+		dec->request_fd = -1;
+	}
 	return ret;
 }
 
@@ -6526,6 +6733,8 @@ static int decode_count_continuous(const uint8_t *file, size_t file_size,
 		.max_long_term_frame_idx = -1,
 	};
 	struct poc_state poc;
+	struct file_window win = { 0 };
+	struct file_prefetch pf = { 0 };
 	bool have_dec = false;
 	bool have_kms = false;
 	uint32_t target = track->sample_count;
@@ -6539,6 +6748,7 @@ static int decode_count_continuous(const uint8_t *file, size_t file_size,
 	memset(&dec, 0, sizeof(dec));
 	dec.video_fd = -1;
 	dec.media_fd = -1;
+	dec.request_fd = -1;
 	memset(&kms, 0, sizeof(kms));
 	kms.fd = -1;
 	display_queue_init(&display, &info);
@@ -6556,6 +6766,23 @@ static int decode_count_continuous(const uint8_t *file, size_t file_size,
 	usage_report_maybe(&usage, opt, decoded, decoded, NULL, submit_us,
 			   &submit, false);
 
+	/*
+	 * Readahead/discard only helps the direct-mmap path; the ffmpeg demux
+	 * path holds each sample on the heap (track->sample_data set). Dropping
+	 * pages behind the cursor is only safe when audio is not sharing the
+	 * same mapping from another thread, so gate discard on !audio_play.
+	 */
+	file_window_init(&win, file, file_size, !track->sample_data,
+			 !opt->audio_play);
+
+	/*
+	 * Start the background prefetcher on the mmap path so slice pages are
+	 * resident before the decode thread's memcpy touches them, hiding storage
+	 * IO behind the hardware decode wait. Enabled whenever the window is
+	 * (direct-mmap path); it helps regardless of audio since it only reads.
+	 */
+	file_prefetch_start(&pf, file, file_size, !track->sample_data);
+
 loop_start:
 	scanned = 0;
 	for (scanned = 0; scanned < track->sample_count && decoded < target;
@@ -6564,6 +6791,14 @@ loop_start:
 		const uint8_t *data = track_sample_data(file, track, scanned);
 		uint32_t off = 0;
 		bool submitted_sample = false;
+
+		if (playback_aborted(opt)) {
+			ret = -ECANCELED;
+			goto out;
+		}
+
+		file_window_advance(&win, s->offset);
+		file_prefetch_set_cursor(&pf, s->offset);
 
 		while (off < s->size && decoded < target && !submitted_sample) {
 			GstH264NalUnit nalu;
@@ -6587,6 +6822,11 @@ loop_start:
 			int32_t top_poc, bottom_poc, curr_poc, poc_msb = 0;
 			uint32_t frame_num_offset = 0;
 			int capture_index;
+
+			if (playback_aborted(opt)) {
+				ret = -ECANCELED;
+				goto out;
+			}
 
 			pres = identify_h264_nalu(parser, track, data, off,
 						  s->size, &nalu);
@@ -6616,8 +6856,7 @@ loop_start:
 			}
 
 			if (slice.field_pic_flag ||
-			    slice.pps->sequence->pic_order_cnt_type > 2 ||
-			    slice.pps->sequence->pic_order_cnt_type == 1) {
+			    slice.pps->sequence->pic_order_cnt_type > 2) {
 				fprintf(stderr,
 					"sample %u unsupported count slice: field=%u poc_type=%u\n",
 					scanned + 1, slice.field_pic_flag,
@@ -6634,6 +6873,9 @@ loop_start:
 			if (slice.pps->sequence->pic_order_cnt_type == 0)
 				poc_type0_calc(&nalu, &slice, &poc, &top_poc,
 					       &bottom_poc, &poc_msb);
+			else if (slice.pps->sequence->pic_order_cnt_type == 1)
+				poc_type1_calc(&nalu, &slice, &poc, &top_poc,
+					       &bottom_poc, &frame_num_offset);
 			else
 				poc_type2_calc(&nalu, &slice, &poc, &top_poc,
 					       &bottom_poc, &frame_num_offset);
@@ -6759,6 +7001,7 @@ loop_start:
 		poc_state_reset(&poc);
 		dpb_clear(&dpb, &dec);
 		display_queue_init(&display, &info);
+		file_window_reset(&win);
 		if (have_kms) {
 			kms.first_ms = 0;
 			kms.last_ms = 0;
@@ -6799,13 +7042,42 @@ loop_start:
 				    (double)kms.commit_us / kms.frames : 0.0;
 		double sleep_avg = kms.frames ?
 				   (double)kms.sleep_us / kms.frames : 0.0;
+		double n = decoded ? (double)decoded : 1.0;
+		/*
+		 * Per-stage split of the submit path. "prep" (request + controls +
+		 * read + copy + queue) is CPU work done before the hardware runs;
+		 * "wait" is the poll on the request completing (hardware decode); "dq"
+		 * is buffer dequeue. prep+dq is the time that a multi-buffer output
+		 * pipeline could overlap with wait, so it bounds the win from
+		 * pipelining. "read" pre-faults the source slice so the following
+		 * "copy" measures the pure destination write into the (write-combine)
+		 * V4L2 output buffer, separating source fault-in from the CMA store.
+		 */
+		double prep_avg = (double)(submit.request_us + submit.controls_us +
+					   submit.read_us + submit.copy_us +
+					   submit.queue_us) / n;
+		double wait_avg = (double)submit.wait_us / n;
+		double dq_avg = (double)submit.dq_us / n;
 
 		fprintf(stderr,
 			"profile frames=%u avg_us: submit=%.1f commit=%.1f sleep=%.1f max_us: submit=%" PRIu64 " commit=%" PRIu64 " sleep=%" PRIu64 "\n",
 			decoded, submit_avg, commit_avg, sleep_avg,
 			max_submit_us, kms.max_commit_us, kms.max_sleep_us);
+		fprintf(stderr,
+			"profile submit avg_us: request=%.1f controls=%.1f read=%.1f copy=%.1f queue=%.1f wait=%.1f dq=%.1f overlap_prep+dq=%.1f max_us: request=%" PRIu64 " controls=%" PRIu64 " read=%" PRIu64 " copy=%" PRIu64 " queue=%" PRIu64 " wait=%" PRIu64 " dq=%" PRIu64 "\n",
+			(double)submit.request_us / n,
+			(double)submit.controls_us / n,
+			(double)submit.read_us / n,
+			(double)submit.copy_us / n,
+			(double)submit.queue_us / n,
+			wait_avg, dq_avg, prep_avg + dq_avg,
+			submit.max_request_us, submit.max_controls_us,
+			submit.max_read_us,
+			submit.max_copy_us, submit.max_queue_us,
+			submit.max_wait_us, submit.max_dq_us);
 	}
 out:
+	file_prefetch_stop(&pf);
 	if (have_dec) {
 		if (opt->display) {
 			display_queue_clear(&display, &dec);
@@ -6819,93 +7091,6 @@ out:
 	}
 	gst_h264_nal_parser_free(parser);
 	return ret;
-}
-
-static int probe_v4l2_decode(const struct options *opt,
-			     const struct video_track *track)
-{
-	GstH264NalParser *parser = NULL;
-	struct h264_stream_info info = { 0 };
-	uint32_t output_size = max_sample_size(track);
-	uint32_t coded_width;
-	uint32_t coded_height;
-	uint32_t min_capture = 6;
-	uint32_t request_capture = 6;
-	int fd;
-	bool ok = true;
-
-	if (output_size < H264_OUTPUT_SIZE_MIN)
-		output_size = H264_OUTPUT_SIZE_MIN;
-
-	parser = gst_h264_nal_parser_new();
-	if (!parser)
-		return -1;
-	if (prime_h264_parser(parser, track, &info)) {
-		fprintf(stderr, "failed to parse avcC SPS/PPS\n");
-		gst_h264_nal_parser_free(parser);
-		return -1;
-	}
-	coded_width = h264_info_coded_width(&info);
-	coded_height = h264_info_coded_height(&info);
-	min_capture = min_capture_buffers(&info, info.num_ref_frames, false);
-	request_capture = min_capture + read_capture_extra_buffers();
-	if (request_capture > LITE_CAPTURE_BUFFERS)
-		request_capture = LITE_CAPTURE_BUFFERS;
-	request_capture = clamp_capture_request_to_cma(coded_width,
-						       coded_height,
-						       min_capture,
-						       request_capture,
-						       output_size, true);
-
-	fd = open(opt->video_dev, O_RDWR | O_CLOEXEC);
-	if (fd < 0) {
-		fprintf(stderr, "open %s failed: %s\n", opt->video_dev,
-			strerror(errno));
-		gst_h264_nal_parser_free(parser);
-		return -1;
-	}
-
-	fprintf(stderr, "v4l2 decode probe video=%s media=%s\n",
-		opt->video_dev, opt->media_dev ? opt->media_dev : "auto");
-
-	print_v4l2_capabilities(fd);
-	ok &= enum_v4l2_formats(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT,
-				V4L2_PIX_FMT_H264_SLICE, "output");
-	ok &= enum_v4l2_formats(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE,
-				V4L2_PIX_FMT_SUNXI_TILED_NV12, "capture");
-	probe_h264_controls(fd);
-
-	if (set_v4l2_format(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT,
-			    V4L2_PIX_FMT_H264_SLICE, coded_width,
-			    coded_height, output_size, NULL, "output", true))
-		ok = false;
-	if (set_v4l2_format(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE,
-			    V4L2_PIX_FMT_SUNXI_TILED_NV12, coded_width,
-			    coded_height, 0, NULL, "capture", true))
-		ok = false;
-
-	if (ok && check_capture_memory_budget(coded_width, coded_height,
-					      min_capture, output_size) == 0) {
-		if (request_v4l2_buffers_probe(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT,
-					       1, "output"))
-			ok = false;
-		if (request_v4l2_buffers_probe(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE,
-					       request_capture, "capture"))
-			ok = false;
-		release_v4l2_buffers(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE, "capture");
-		release_v4l2_buffers(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT, "output");
-	} else if (ok) {
-		ok = false;
-	}
-
-	close(fd);
-	gst_h264_nal_parser_free(parser);
-
-	if (probe_media_request(opt->media_dev))
-		ok = false;
-
-	fprintf(stderr, "v4l2 decode probe %s\n", ok ? "ok" : "failed");
-	return ok ? 0 : -1;
 }
 
 static int play_one_file(const struct options *base_opt, const char *path,
@@ -7131,6 +7316,12 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	if (install_signal_handlers()) {
+		fprintf(stderr, "failed to install signal handlers: %s\n",
+			strerror(errno));
+		return 1;
+	}
+
 	if (playlist_build(&list, opt.input)) {
 		fprintf(stderr, "failed to build playlist from %s\n", opt.input);
 		return 1;
@@ -7144,12 +7335,16 @@ int main(int argc, char **argv)
 			bool seamless = opt.loop && list.count == 1;
 			ret = play_one_file(&opt, list.items[i], i, list.count,
 					    seamless);
+			if (g_abort_requested)
+				goto out;
 			if (ret && !opt.loop)
 				goto out;
 		}
-	} while (opt.loop && list.count > 1);
+	} while (opt.loop && list.count > 1 && !g_abort_requested);
 
 out:
 	playlist_free(&list);
+	if (g_abort_requested)
+		ret = 130;
 	return ret;
 }
