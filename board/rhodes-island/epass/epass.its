@@ -17,7 +17,7 @@
 			load = <0x80008000>;
 			entry = <0x80008000>;
 			hash {
-				algo = "sha256";
+				algo = "crc32";
 			};
 		};
 
@@ -28,7 +28,7 @@
 			arch = "arm";
 			compression = "none";
 			hash {
-				algo = "sha256";
+				algo = "crc32";
 			};
 		};
 	};

@@ -649,6 +649,7 @@ endmenu
 	source "package/wf111/Config.in"
 	source "package/wilc-driver/Config.in"
 	source "package/wipe/Config.in"
+	source "package/ws73-radio/Config.in"
 	source "package/xorriso/Config.in"
 	source "package/xr819-xradio/Config.in"
 endmenu

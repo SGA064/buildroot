@@ -43,7 +43,10 @@ Put the board in FEL mode and run:
       -k output/images/fitImage.itb \
       -u output/images/rootfs.ubi
 
+Use `-L bootlogo.bmp` when a boot logo should also be written.
+
 The U-Boot DFU layout matches the SPI-NAND partition map in the ePass
 device tree:
 
-  128k(spl), 896k(u-boot), 128k(env), 8m(kernel), -(ubi)
+  128k(spl), 896k(u-boot), 512k(bootlogo), 128k(env),
+  8m(kernel), -(ubi)

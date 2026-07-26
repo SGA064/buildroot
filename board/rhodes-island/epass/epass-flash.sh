@@ -9,10 +9,10 @@ set -eu
 default_boot_image="u-boot-sunxi-with-spl.bin"
 
 bootloader_max=$((0x100000))
-uboot_max=$((0x0e0000))
+bootlogo_max=$((0x080000))
 env_max=$((0x020000))
 kernel_max=$((0x800000))
-ubi_max=$((0x76e0000))
+ubi_max=$((0x7660000))
 
 dfu_dev="${DFU_DEV:-1f3a:1010}"
 dfu_wait="${DFU_WAIT:-30}"
@@ -23,8 +23,7 @@ dfu_util="${DFU_UTIL:-dfu-util}"
 
 boot_image=
 bootloader_image=
-bootloader_uboot_image=
-bootloader_uboot_temp=
+bootlogo_image=
 env_image=
 kernel_image=
 ubi_image=
@@ -54,10 +53,12 @@ Options:
               otherwise it uses ${default_boot_image}.
   -B FILE     Flash complete bootloader from FILE, max 0x100000 bytes.
               The device DFU alt bootloader writes SPL in the BootROM
-              SPI-NAND split-page layout and writes U-Boot proper.
+              SPI-NAND split-page layout, validates U-Boot and verifies
+              both regions by read-back.
+  -L FILE     Flash BMP FILE to the bootlogo partition, max 0x80000 bytes
   -e FILE     Flash FILE to the env partition, max 0x20000 bytes
   -k FILE     Flash FILE to the kernel partition, max 0x800000 bytes
-  -u FILE     Flash FILE to the ubi partition, max 0x76e0000 bytes
+  -u FILE     Flash FILE to the ubi partition, max 0x7660000 bytes
   -d VID:PID  dfu-util USB device selector, default: ${dfu_dev}
   -t SEC      DFU wait timeout in seconds, default: ${dfu_wait}
   -r N        Retry each dfu-util transfer up to N times, default: ${dfu_retries}
@@ -68,9 +69,10 @@ Options:
   -F          Skip FEL boot and use an already-running DFU device
   -l          Boot U-Boot over FEL unless -F is used, list DFU alt settings,
               then exit
-  -V          Verify flashed raw alts by DFU upload: u-boot/env/kernel.
+  -V          Verify flashed raw alts by DFU upload: bootlogo/env/kernel.
               UBI is verified only when DFU_VERIFY=all is set explicitly.
-  -N          Disable DFU upload verification
+  -N          Disable DFU upload verification. Device-side bootloader
+              verification remains enabled.
   -n          Do not request USB DFU reset after the last transfer
   -h          Show this help
 
@@ -81,11 +83,14 @@ Environment:
   DFU_WAIT    DFU wait timeout in seconds, default: 30
   DFU_RETRIES dfu-util transfer attempts, default: 2
   DFU_VERIFY  Verification mode: none, bootloader, raw, all.
+              bootloader relies on mandatory device-side verification;
+              raw uploads bootlogo/env/kernel; all also uploads UBI.
               default: bootloader
 
 Examples:
   epass-flash.sh -l
   epass-flash.sh -B u-boot-sunxi-with-spl.bin
+  epass-flash.sh -L bootlogo.bmp
   epass-flash.sh -k fitImage.itb -u rootfs.ubi
   epass-flash.sh -B u-boot-sunxi-with-spl.bin -k fitImage.itb -u rootfs.ubi
   epass-flash.sh -F -V -k fitImage.itb
@@ -103,7 +108,6 @@ cleanup()
 	[ -z "$dfu_list_file" ] || rm -f "$dfu_list_file"
 	[ -z "$dfu_verify_file" ] || rm -f "$dfu_verify_file"
 	[ -z "$fel_temp_image" ] || rm -f "$fel_temp_image"
-	[ -z "$bootloader_uboot_temp" ] || rm -f "$bootloader_uboot_temp"
 }
 
 info()
@@ -124,11 +128,24 @@ hex_at()
 
 le32_at()
 {
+	# The byte values emitted by od intentionally become positional fields.
+	# shellcheck disable=SC2046
 	set -- $(dd if="$1" bs=1 skip="$2" count=4 2>/dev/null |
 		od -An -tu1)
 
 	[ "$#" -eq 4 ] || return 1
 	echo $(($1 + ($2 * 256) + ($3 * 65536) + ($4 * 16777216)))
+}
+
+le16_at()
+{
+	# The byte values emitted by od intentionally become positional fields.
+	# shellcheck disable=SC2046
+	set -- $(dd if="$1" bs=1 skip="$2" count=2 2>/dev/null |
+		od -An -tu1)
+
+	[ "$#" -eq 2 ] || return 1
+	echo $(($1 + ($2 * 256)))
 }
 
 check_file()
@@ -150,6 +167,82 @@ check_size()
 	if [ "$size" -gt "$max" ]; then
 		die "$name image is too large: $image is $size bytes, max is $max bytes"
 	fi
+}
+
+check_bmp()
+{
+	image="$1"
+	actual_size="$(file_size "$image")"
+
+	[ "$(hex_at "$image" 0 2)" = "424d" ] ||
+		die "bootlogo is not a BMP file: $image"
+
+	declared_size="$(le32_at "$image" 2)" ||
+		die "cannot read BMP file size: $image"
+	data_offset="$(le32_at "$image" 10)" ||
+		die "cannot read BMP data offset: $image"
+	dib_size="$(le32_at "$image" 14)" ||
+		die "cannot read BMP DIB header size: $image"
+	width="$(le32_at "$image" 18)" ||
+		die "cannot read BMP width: $image"
+	height="$(le32_at "$image" 22)" ||
+		die "cannot read BMP height: $image"
+	planes="$(le16_at "$image" 26)" ||
+		die "cannot read BMP plane count: $image"
+	bpp="$(le16_at "$image" 28)" ||
+		die "cannot read BMP bit depth: $image"
+	compression="$(le32_at "$image" 30)" ||
+		die "cannot read BMP compression: $image"
+
+	[ "$declared_size" -eq "$actual_size" ] ||
+		die "BMP header size $declared_size does not match file size $actual_size: $image"
+	[ "$dib_size" -ge 40 ] ||
+		die "unsupported BMP DIB header size $dib_size: $image"
+	if [ "$data_offset" -lt $((14 + dib_size)) ] ||
+	   [ "$data_offset" -ge "$actual_size" ]; then
+		die "invalid BMP data offset $data_offset: $image"
+	fi
+	[ "$planes" -eq 1 ] ||
+		die "BMP must contain exactly one plane: $image"
+	if [ "$width" -le 0 ] || [ "$width" -gt 32768 ] ||
+	   [ "$height" -le 0 ] || [ "$height" -gt 32768 ]; then
+		die "unsupported BMP dimensions ${width}x${height}: $image"
+	fi
+
+	case "$bpp:$compression" in
+	1:0|8:0|16:0|16:3|24:0|32:0|32:3)
+		;;
+	*)
+		die "unsupported BMP format: ${bpp} bpp, compression $compression: $image"
+		;;
+	esac
+
+	if [ "$compression" -eq 3 ]; then
+		[ "$data_offset" -ge 66 ] ||
+			die "BMP bitfields header is too short: $image"
+		red_mask="$(le32_at "$image" 54)" ||
+			die "cannot read BMP red mask: $image"
+		green_mask="$(le32_at "$image" 58)" ||
+			die "cannot read BMP green mask: $image"
+		blue_mask="$(le32_at "$image" 62)" ||
+			die "cannot read BMP blue mask: $image"
+
+		case "$bpp:$red_mask:$green_mask:$blue_mask" in
+		16:63488:2016:31|32:16711680:65280:255)
+			;;
+		*)
+			die "unsupported BMP channel masks: $image"
+			;;
+		esac
+	fi
+
+	row_words=$(( (width * bpp + 31) / 32 ))
+	row_size=$((row_words * 4))
+	pixel_size=$((row_size * height))
+	[ "$pixel_size" -le $((actual_size - data_offset)) ] ||
+		die "BMP pixel data is truncated: $image"
+
+	info "Validated bootlogo BMP: ${width}x${height}, ${bpp} bpp, compression $compression"
 }
 
 check_uint()
@@ -261,62 +354,25 @@ prepare_fel_boot()
 	if [ -n "$fel_spl_image" ] && [ -n "$fel_uboot_image" ]; then
 		check_file "$fel_spl_image"
 		check_file "$fel_uboot_image"
-		fel_boot_method=split
+		fel_boot_method="split"
 		return
 	fi
 
 	die "explicit sunxi-fel spl boot needs both SPL (-s) and raw U-Boot proper (-p) images"
 }
 
-prepare_bootloader_uboot_image()
-{
-	src_image="$1"
-	image_size="$(file_size "$src_image")"
-	spl_len="$(le32_at "$src_image" 16)" ||
-		die "cannot read eGON SPL length from $src_image"
-	u_boot_offset=
-
-	if [ "$(hex_at "$src_image" 4 8)" != "65474f4e2e425430" ]; then
-		die "bootloader image is not an Allwinner eGON image: $src_image"
-	fi
-
-	for offset in 131072 "$spl_len" 32768; do
-		if [ "$offset" -lt "$image_size" ] &&
-		   [ "$(hex_at "$src_image" "$offset" 4)" = "27051956" ]; then
-			u_boot_offset="$offset"
-			break
-		fi
-	done
-
-	if [ -z "$u_boot_offset" ]; then
-		die "cannot find U-Boot legacy image inside $src_image"
-	fi
-
-	bootloader_uboot_temp="${TMPDIR:-/tmp}/epass-uboot-proper.$$"
-	if [ $((u_boot_offset % 512)) -eq 0 ]; then
-		dd if="$src_image" of="$bootloader_uboot_temp" bs=512 \
-			skip=$((u_boot_offset / 512)) 2>/dev/null ||
-			die "failed to extract U-Boot proper from $src_image"
-	else
-		dd if="$src_image" of="$bootloader_uboot_temp" bs=1 \
-			skip="$u_boot_offset" 2>/dev/null ||
-			die "failed to extract U-Boot proper from $src_image"
-	fi
-
-	bootloader_uboot_image="$bootloader_uboot_temp"
-	check_size "u-boot proper" "$bootloader_uboot_image" "$uboot_max"
-	info "Extracted U-Boot proper for NAND offset 0x20000 from $src_image offset $(printf '0x%x' "$u_boot_offset")"
-}
-
 trap cleanup EXIT HUP INT TERM
 
-while getopts "b:B:e:k:u:d:t:r:s:p:a:FVNlnh" opt; do
+while getopts "b:B:L:e:k:u:d:t:r:s:p:a:FVNlnh" opt; do
 	case "$opt" in
 	b)
 		boot_image="$OPTARG"
 		;;
 	B)
 		bootloader_image="$OPTARG"
+		;;
+	L)
+		bootlogo_image="$OPTARG"
 		;;
 	e)
 		env_image="$OPTARG"
@@ -391,17 +447,23 @@ check_uint "DFU retry count" "$dfu_retries"
 check_verify_mode
 [ "$skip_fel" -eq 1 ] || check_file "$boot_image"
 check_file "$bootloader_image"
+check_file "$bootlogo_image"
 check_file "$env_image"
 check_file "$kernel_image"
 check_file "$ubi_image"
 
 [ -n "$bootloader_image" ] && check_size "bootloader" "$bootloader_image" "$bootloader_max"
+if [ -n "$bootlogo_image" ]; then
+	check_size "bootlogo" "$bootlogo_image" "$bootlogo_max"
+	check_bmp "$bootlogo_image"
+fi
 [ -n "$env_image" ] && check_size "env" "$env_image" "$env_max"
 [ -n "$kernel_image" ] && check_size "kernel" "$kernel_image" "$kernel_max"
 [ -n "$ubi_image" ] && check_size "ubi" "$ubi_image" "$ubi_max"
 
 if [ "$list_only" -eq 0 ] &&
    [ -z "$bootloader_image" ] &&
+   [ -z "$bootlogo_image" ] &&
    [ -z "$env_image" ] &&
    [ -z "$kernel_image" ] &&
    [ -z "$ubi_image" ]; then
@@ -418,7 +480,6 @@ if ! command -v "$dfu_util" >/dev/null 2>&1; then
 fi
 
 [ "$skip_fel" -eq 1 ] || prepare_fel_boot
-[ -n "$bootloader_image" ] && prepare_bootloader_uboot_image "$bootloader_image"
 
 dfu_list_file="${TMPDIR:-/tmp}/epass-dfu-list.$$"
 
@@ -523,10 +584,10 @@ should_verify_alt()
 		return 1
 		;;
 	bootloader)
-		[ "$alt" = "u-boot" ] && [ -n "$bootloader_image" ]
+		return 1
 		;;
 	raw)
-		[ "$alt" = "u-boot" ] || [ "$alt" = "env" ] ||
+		[ "$alt" = "bootlogo" ] || [ "$alt" = "env" ] ||
 			[ "$alt" = "kernel" ]
 		;;
 	all)
@@ -590,6 +651,8 @@ print_plan()
 	else
 		[ -n "$bootloader_image" ] &&
 			echo "    bootloader: DFU alt bootloader <- $bootloader_image"
+		[ -n "$bootlogo_image" ] &&
+			echo "    bootlogo: DFU alt bootlogo <- $bootlogo_image"
 		[ -n "$env_image" ] &&
 			echo "    env: DFU alt env <- $env_image"
 		[ -n "$kernel_image" ] &&
@@ -618,7 +681,7 @@ info "Available DFU alt settings"
 cat "$dfu_list_file"
 
 [ -n "$bootloader_image" ] && require_alt bootloader
-[ -n "$bootloader_image" ] && should_verify_alt u-boot && require_alt u-boot
+[ -n "$bootlogo_image" ] && require_alt bootlogo
 [ -n "$env_image" ] && require_alt env
 [ -n "$kernel_image" ] && require_alt kernel
 [ -n "$ubi_image" ] && require_alt ubi
@@ -630,7 +693,10 @@ fi
 
 if [ -n "$bootloader_image" ]; then
 	dfu_flash bootloader "$bootloader_image"
-	should_verify_alt u-boot && dfu_verify_prefix u-boot "$bootloader_uboot_image" "$uboot_max"
+fi
+if [ -n "$bootlogo_image" ]; then
+	dfu_flash bootlogo "$bootlogo_image"
+	should_verify_alt bootlogo && dfu_verify_prefix bootlogo "$bootlogo_image" "$bootlogo_max"
 fi
 if [ -n "$env_image" ]; then
 	dfu_flash env "$env_image"
