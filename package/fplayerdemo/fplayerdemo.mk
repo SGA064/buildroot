@@ -11,26 +11,39 @@ FPLAYERDEMO_OVERRIDE_SRCDIR = $(FPLAYERDEMO_PKGDIR)/src
 FPLAYERDEMO_DEPENDENCIES = \
 	alsa-lib \
 	ffmpeg \
-	gst1-plugins-bad \
-	gstreamer1 \
 	host-pkgconf \
 	libdrm
 
 FPLAYERDEMO_PKGS = \
 	alsa \
-	gstreamer-codecparsers-1.0 \
-	gstreamer-video-1.0 \
 	libavcodec \
-	libavformat \
 	libavutil \
 	libdrm
 
+FPLAYERDEMO_SOURCES = \
+	$(@D)/audio.c \
+	$(@D)/common.c \
+	$(@D)/display.c \
+	$(@D)/file_io.c \
+	$(@D)/fplayerdemo.c \
+	$(@D)/h264.c \
+	$(@D)/h264_parser.c \
+	$(@D)/media.c \
+	$(@D)/video_decoder.c
+
 define FPLAYERDEMO_BUILD_CMDS
-	$(TARGET_CC) $(TARGET_CFLAGS) -O3 -DNDEBUG -DGST_USE_UNSTABLE_API \
+	$(HOSTCC) $(HOST_CFLAGS) -std=gnu11 -O2 -Wall -Wextra -Werror \
+		-I$(@D) \
+		-o $(@D)/h264-parser-test \
+		$(@D)/h264_parser.c \
+		$(FPLAYERDEMO_PKGDIR)/tests/h264_parser_test.c \
+		$(HOST_LDFLAGS)
+	$(@D)/h264-parser-test --selftest
+	$(TARGET_CC) $(TARGET_CFLAGS) -O3 -DNDEBUG \
 		-pthread \
 		`$(PKG_CONFIG_HOST_BINARY) --cflags $(FPLAYERDEMO_PKGS)` \
 		-DHAVE_LIBAVCODEC \
-		-o $(@D)/fplayerdemo $(@D)/fplayerdemo.c \
+		-o $(@D)/fplayerdemo $(FPLAYERDEMO_SOURCES) \
 		$(TARGET_LDFLAGS) \
 		`$(PKG_CONFIG_HOST_BINARY) --libs $(FPLAYERDEMO_PKGS)` \
 		-pthread
