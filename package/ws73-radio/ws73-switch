@@ -14,14 +14,35 @@ unload_module()
 	fi
 }
 
-usage()
+stop_wifi()
 {
-	echo "Usage: ws73-switch {radio|wifi|sd|status}" >&2
-	exit 2
+	if ! is_loaded wifi_soc; then
+		return
+	fi
+	if ip link show wlan0 >/dev/null 2>&1; then
+		if command -v wpa_cli >/dev/null 2>&1; then
+			wpa_cli -i wlan0 terminate >/dev/null 2>&1 || true
+		fi
+		ip link set wlan0 down >/dev/null 2>&1 || true
+	fi
+	unload_module wifi_soc
 }
 
-case "${1:-}" in
-radio|wifi)
+stop_ble()
+{
+	if ! is_loaded ble_soc; then
+		return
+	fi
+	if command -v btmgmt >/dev/null 2>&1; then
+		btmgmt power off >/dev/null 2>&1 || true
+	elif command -v bluetoothctl >/dev/null 2>&1; then
+		bluetoothctl power off >/dev/null 2>&1 || true
+	fi
+	unload_module ble_soc
+}
+
+check_mmc0_available()
+{
 	if grep -q '^/dev/mmcblk0' /proc/mounts; then
 		echo "error: unmount the MMC0 SD card before switching to WS73" >&2
 		exit 1
@@ -32,29 +53,50 @@ radio|wifi)
 			exit 1
 		fi
 	done
+}
+
+usage()
+{
+	echo "Usage: ws73-switch {radio|wifi|ble|sle|sd|status}" >&2
+	exit 2
+}
+
+case "${1:-}" in
+radio)
+	check_mmc0_available
 	modprobe plat_soc
 	modprobe wifi_soc
 	modprobe ble_soc
 	modprobe sle_soc
 	;;
+wifi)
+	check_mmc0_available
+	unload_module sle_soc
+	stop_ble
+	modprobe plat_soc
+	modprobe wifi_soc
+	;;
+ble)
+	check_mmc0_available
+	unload_module sle_soc
+	stop_wifi
+	modprobe plat_soc
+	modprobe ble_soc
+	;;
+sle)
+	check_mmc0_available
+	stop_ble
+	stop_wifi
+	modprobe plat_soc
+	modprobe sle_soc
+	;;
 sd)
-	if ip link show wlan0 >/dev/null 2>&1; then
-		if command -v wpa_cli >/dev/null 2>&1; then
-			wpa_cli -i wlan0 terminate >/dev/null 2>&1 || true
-		fi
-		ip link set wlan0 down >/dev/null 2>&1 || true
-	fi
-	if command -v btmgmt >/dev/null 2>&1; then
-		btmgmt power off >/dev/null 2>&1 || true
-	elif command -v bluetoothctl >/dev/null 2>&1; then
-		bluetoothctl power off >/dev/null 2>&1 || true
-	fi
 	# BusyBox modprobe -r also tries to remove dependencies.  Removing a
 	# leaf therefore returns failure while plat_soc is still in use and,
 	# with set -e, aborts this sequence after the first module.
 	unload_module sle_soc
-	unload_module ble_soc
-	unload_module wifi_soc
+	stop_ble
+	stop_wifi
 	unload_module plat_soc
 	;;
 status)

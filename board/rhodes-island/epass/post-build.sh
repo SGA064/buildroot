@@ -102,3 +102,9 @@ rm -f -- "${libdir}/libgpiodcxx.so"* "${libdir}/libstdc++.so"*
 
 # fplayerdemo does not link libavfilter.
 rm -f -- "${libdir}/libavfilter.so"*
+
+authorized_keys="${target_dir}/root/.ssh/authorized_keys"
+if [ -f "${authorized_keys}" ]; then
+	chmod 0700 -- "${target_dir}/root/.ssh"
+	chmod 0600 -- "${authorized_keys}"
+fi
