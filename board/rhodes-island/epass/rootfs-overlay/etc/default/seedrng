@@ -1,0 +1,4 @@
+# The random seed must live on the persistent /data volume, which
+# S99epass-late mounts before it runs seedrng.  This is the only place
+# SEED_DIR is defined.
+SEED_DIR="/data/seedrng"

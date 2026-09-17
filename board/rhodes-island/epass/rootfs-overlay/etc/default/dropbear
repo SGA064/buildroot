@@ -1,0 +1,8 @@
+# Dropbear's default 24 KB channel receive window stalls downloads on this
+# board: the Wi-Fi link idles in power save, so small packets see a ~90 ms
+# effective RTT (DTIM/beacon wakeup).  A 24 KB window with window adjustments
+# every 8 KB caps a single channel at roughly 260 KB/s regardless of the
+# 24 Mbps the radio can actually sustain.  A 1 MB window measured 5x faster
+# (2 -> 10 Mbps); larger windows gave nothing more, since the remaining limit
+# is the 408 MHz CPU doing chacha20.
+DROPBEAR_ARGS="-W 262144"

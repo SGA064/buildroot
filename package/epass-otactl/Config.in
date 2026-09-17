@@ -1,0 +1,7 @@
+config BR2_PACKAGE_EPASS_OTACTL
+	bool "epass-otactl"
+	depends on BR2_USE_MMU
+	select BR2_PACKAGE_MTD
+	help
+	  Manage the rotating raw-MTD boot control records used by the
+	  Rhodes Island ePass U-Boot recovery update scheme.

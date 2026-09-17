@@ -1,0 +1,120 @@
+#!/bin/sh
+
+DAEMON="epass-late-init"
+PIDFILE="/run/${DAEMON}.pid"
+READY_FILE="/run/${DAEMON}.ready"
+LOGFILE="/var/log/${DAEMON}.log"
+
+# shellcheck source=/dev/null
+. /usr/lib/epass-init-functions.sh
+
+# Locate data by volume name, independent of its UBI device number.
+find_volume()
+{
+	wanted="$1"
+
+	for name_file in /sys/class/ubi/ubi*_*/name; do
+		[ -f "$name_file" ] || continue
+		[ "$(sed -n '1p' "$name_file")" = "$wanted" ] || continue
+		volume="${name_file%/name}"
+		volume="${volume##*/}"
+		echo "${volume%_*}:$wanted"
+		return 0
+	done
+
+	return 1
+}
+
+mount_data()
+{
+	mountpoint -q /data && return 0
+	mkdir -p /data || return 1
+	mount_source="$(find_volume data)" || {
+		echo "data volume not found on any attached UBI device" >&2
+		return 1
+	}
+	mount -t ubifs "$mount_source" /data
+}
+
+cleanup_ota()
+{
+	[ -f /data/ota/.epass-update ] || return 0
+	status="$(/usr/sbin/epass-otactl status 2>/dev/null)" || return 0
+	case "$status" in
+	mode=normal*)
+		rm -rf /data/ota || return 1
+		sync
+		;;
+	esac
+}
+
+worker()
+{
+	trap 'exit 1' HUP INT TERM
+	trap 'remove_own_pidfile "$PIDFILE"' EXIT
+
+	mount_data || return 1
+	cleanup_ota || return 1
+	# Seeding the RNG is best effort: upstream S01seedrng is "never fail, as
+	# this isn't worth making a fuss over".  Keep the chain going so a seed
+	# problem cannot keep SSH and MTP from starting.
+	/etc/init.d/seedrng restore ||
+		echo "seedrng failed; continuing" >&2
+	/etc/init.d/umtprd start || return 1
+	/etc/init.d/dropbear start || return 1
+	: > "$READY_FILE"
+	echo "ePass late initialization completed"
+}
+
+start()
+{
+	printf 'Scheduling ePass late initialization: '
+	if [ -e "$READY_FILE" ]; then
+		echo "OK (ready)"
+		return 0
+	fi
+	if pid_is_running "$PIDFILE"; then
+		echo "OK (pending)"
+		return 0
+	fi
+
+	rm -f "$READY_FILE"
+	if start_worker "$PIDFILE" "$LOGFILE"; then
+		echo "OK"
+	else
+		echo "FAIL"
+		return 1
+	fi
+}
+
+stop()
+{
+	stop_worker "$PIDFILE"
+	rm -f "$READY_FILE"
+	/etc/init.d/dropbear stop
+	/etc/init.d/umtprd stop
+	/etc/init.d/seedrng stop
+	if mountpoint -q /data; then
+		umount /data || return 1
+	fi
+}
+
+case "$1" in
+start)
+	start
+	;;
+stop)
+	stop
+	;;
+restart|reload)
+	stop
+	start
+	;;
+worker)
+	worker
+	;;
+*)
+	echo "Usage: $0 {start|stop|restart|reload}" >&2
+	exit 1
+	;;
+esac

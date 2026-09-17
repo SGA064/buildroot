@@ -3,9 +3,9 @@ config BR2_PACKAGE_WS73_RADIO
 	depends on BR2_LINUX_KERNEL
 	select BR2_LINUX_NEEDS_MODULES # not using kernel-module infra
 	help
-	  Build and install the Ai-WS1-CBS WS73/Hi3873S SDIO Wi-Fi,
-	  Bluetooth HCI, and SparkLink transport modules, device
-	  firmware, runtime INI, and the ws73-switch helper.
+	  Build and install the Ai-WS1-CBS WS73/Hi3873S SDIO Wi-Fi
+	  modules, device firmware, runtime INI, and the ws73-switch
+	  helper. Bluetooth and SLE support are disabled.
 
 	  The vendor SDK must be available next to the Buildroot tree as
 	  Ai-WS1-CBS-CBE_Linux.

@@ -1,0 +1,263 @@
+#!/bin/sh
+
+set -eu
+
+stage_dir=
+step_index=0
+step_total=0
+# The image size limits are owned by epass-otactl and read back from
+# `epass-otactl status` below, so the two can never disagree.
+kernel_max_size=
+rootfs_max_size=
+
+die()
+{
+	echo "epass-ota-install: $*" >&2
+	exit 1
+}
+
+cleanup()
+{
+	[ -z "$stage_dir" ] || [ ! -d "$stage_dir" ] || rm -rf "$stage_dir"
+}
+
+usage()
+{
+	cat >&2 <<'EOF'
+Usage:
+  epass-ota-install FIT_IMAGE ROOTFS_UBIFS
+  epass-ota-install --kernel FIT_IMAGE
+  epass-ota-install --rootfs ROOTFS_UBIFS
+  epass-ota-install --kernel FIT_IMAGE --rootfs ROOTFS_UBIFS
+EOF
+	exit 2
+}
+
+find_volume()
+{
+	wanted="$1"
+
+	for name_file in /sys/class/ubi/ubi*_*/name; do
+		[ -f "$name_file" ] || continue
+		[ "$(sed -n '1p' "$name_file")" = "$wanted" ] || continue
+		volume="${name_file%/name}"
+		echo "/dev/${volume##*/}"
+		return 0
+	done
+
+	return 1
+}
+
+find_mtd_class()
+{
+	wanted="$1"
+	mtd_num="$(sed -n "s/^mtd\\([0-9][0-9]*\\):.*\"${wanted}\"$/\\1/p" /proc/mtd | sed -n '1p')"
+	[ -n "$mtd_num" ] || return 1
+	echo "/sys/class/mtd/mtd${mtd_num}"
+}
+
+check_ubi_capacity()
+{
+	device="$1"
+	image="$2"
+	size="$3"
+	maximum="$4"
+	class_dir="/sys/class/ubi/${device##*/}"
+	reserved_ebs="$(sed -n '1p' "$class_dir/reserved_ebs")"
+	usable_eb_size="$(sed -n '1p' "$class_dir/usable_eb_size")"
+	capacity=$((reserved_ebs * usable_eb_size))
+
+	# The volume is slightly larger than 20 MiB because it is sized in erase
+	# blocks, while the boot control record stores a 20 MiB limit that U-Boot
+	# and epass-otactl enforce.  Reject here too, so an oversized image is
+	# never staged and then refused at request-update time.
+	[ "$size" -le "$maximum" ] ||
+		die "$image is $size bytes but the rootfs limit is $maximum bytes"
+	[ "$size" -le "$capacity" ] ||
+		die "$image is $size bytes but $device holds only $capacity bytes"
+}
+
+check_raw_capacity()
+{
+	class_dir="$1"
+	image="$2"
+	size="$3"
+	maximum="$4"
+	mtd_size="$(sed -n '1p' "$class_dir/size")"
+	erase_size="$(sed -n '1p' "$class_dir/erasesize")"
+	bad_blocks="$(sed -n '1p' "$class_dir/bad_blocks")"
+	good_blocks=$((mtd_size / erase_size - bad_blocks))
+	capacity=$((good_blocks * erase_size))
+
+	[ "$size" -le "$maximum" ] ||
+		die "$image is $size bytes but the supported kernel limit is $maximum bytes"
+	[ "$size" -le "$capacity" ] ||
+		die "$image is $size bytes but ${class_dir##*/} has only $capacity good bytes"
+}
+
+get_file_size()
+{
+	# BusyBox stat is disabled. With a single option and stdin input, wc
+	# prints the bare count: no padding and no file name to strip.
+	wc -c < "$1"
+}
+
+begin_step()
+{
+	step_index=$((step_index + 1))
+	echo "[$step_index/$step_total] $*" >&2
+}
+
+hash_file()
+{
+	sha256sum "$1" | awk '{print $1}'
+}
+
+# Keep progress updates in the parent shell; the resulting hash is returned in
+# staged_hash, while each caller retains its target-specific size and metadata.
+stage_image()
+{
+	source_image="$1"
+	staged_image="$2"
+	image_label="$3"
+	begin_step "Calculating source $image_label SHA-256"
+	source_hash="$(hash_file "$source_image")" || die "cannot hash $image_label"
+	begin_step "Copying $image_label to OTA staging directory"
+	cp "$source_image" "$staged_image" || die "cannot stage $image_label"
+	begin_step "Verifying staged $image_label"
+	staged_hash="$(hash_file "$staged_image")" || die "cannot hash staged $image_label"
+	[ "$staged_hash" = "$source_hash" ] || die "staged $image_label verification failed"
+}
+
+fit_image=
+rootfs_image=
+if [ "$#" -eq 2 ] && [ "$1" != --kernel ] && [ "$1" != --rootfs ]; then
+	fit_image="$1"
+	rootfs_image="$2"
+else
+	while [ "$#" -gt 0 ]; do
+		[ "$#" -ge 2 ] || usage
+		case "$1" in
+		--kernel)
+			[ -z "$fit_image" ] || usage
+			fit_image="$2"
+			;;
+		--rootfs)
+			[ -z "$rootfs_image" ] || usage
+			rootfs_image="$2"
+			;;
+		*)
+			usage
+			;;
+		esac
+		shift 2
+	done
+fi
+[ -n "$fit_image" ] || [ -n "$rootfs_image" ] || usage
+[ -z "$fit_image" ] || [ -r "$fit_image" ] ||
+	die "FIT image is not readable: $fit_image"
+[ -z "$fit_image" ] || [ -f "$fit_image" ] ||
+	die "FIT image is not a regular file: $fit_image"
+[ -z "$rootfs_image" ] || [ -r "$rootfs_image" ] ||
+	die "UBIFS image is not readable: $rootfs_image"
+[ -z "$rootfs_image" ] || [ -f "$rootfs_image" ] ||
+	die "UBIFS image is not a regular file: $rootfs_image"
+
+for command in awk cp dd epass-otactl flock ls mkdir mountpoint mv od rm \
+	sha256sum sed sync tr wc; do
+	command -v "$command" >/dev/null 2>&1 || die "required command not found: $command"
+done
+
+exec 9>/run/epass-ota-install.lock
+flock -n 9 || die "another OTA installation is already running"
+trap cleanup EXIT HUP INT TERM
+
+if [ -n "$fit_image" ]; then
+	[ "$(dd if="$fit_image" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "d00dfeed" ] ||
+		die "invalid FIT image magic"
+fi
+if [ -n "$rootfs_image" ]; then
+	[ "$(dd if="$rootfs_image" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "31181006" ] ||
+		die "invalid UBIFS image magic"
+fi
+
+# epass-otactl derives `current` from the same /proc/cmdline scan this script
+# used to repeat, and reports `current=unknown` when that scan finds nothing.
+# Parsing it once here is therefore equivalent to checking the command line
+# ourselves, and keeps a single definition of "running in normal OTA mode".
+mode=
+reported_current=
+status="$(epass-otactl status)" || die "cannot read boot control state"
+for field in $status; do
+	case "$field" in
+	mode=*) mode="${field#mode=}" ;;
+	current=*) reported_current="${field#current=}" ;;
+	kernel_limit=*) kernel_max_size="${field#kernel_limit=}" ;;
+	rootfs_limit=*) rootfs_max_size="${field#rootfs_limit=}" ;;
+	esac
+done
+[ "$reported_current" = normal ] || die "boot control state does not match the running system"
+[ "$mode" = normal ] || die "an update is already pending"
+if [ -z "$kernel_max_size" ] || [ -z "$rootfs_max_size" ]; then
+	die "boot control state does not report the image size limits"
+fi
+mountpoint -q /data || die "/data is not mounted"
+
+if [ -n "$fit_image" ]; then
+	fit_size="$(get_file_size "$fit_image")"
+	kernel_class="$(find_mtd_class kernel)" || die "kernel MTD partition not found"
+	check_raw_capacity "$kernel_class" "$fit_image" "$fit_size" "$kernel_max_size"
+fi
+if [ -n "$rootfs_image" ]; then
+	rootfs_source_size="$(get_file_size "$rootfs_image")"
+	rootfs_device="$(find_volume rootfs)" || die "rootfs UBI volume not found"
+	check_ubi_capacity "$rootfs_device" "$rootfs_image" \
+		"$rootfs_source_size" "$rootfs_max_size"
+fi
+
+stage_dir="/data/.ota-stage.$$"
+rm -rf "$stage_dir"
+mkdir -p "$stage_dir"
+kernel_size=0
+kernel_hash=-
+rootfs_size=0
+rootfs_hash=-
+targets=
+image_count=0
+[ -z "$fit_image" ] || image_count=$((image_count + 1))
+[ -z "$rootfs_image" ] || image_count=$((image_count + 1))
+step_total=$((image_count * 3 + 4))
+if [ -n "$fit_image" ]; then
+	kernel_size="$fit_size"
+	stage_image "$fit_image" "$stage_dir/fitImage.itb" "FIT image"
+	kernel_hash="$staged_hash"
+	targets=kernel
+fi
+if [ -n "$rootfs_image" ]; then
+	rootfs_size="$rootfs_source_size"
+	stage_image "$rootfs_image" "$stage_dir/rootfs.ubifs" "rootfs image"
+	rootfs_hash="$staged_hash"
+	[ -z "$targets" ] || targets="$targets,"
+	targets="${targets}rootfs"
+fi
+
+begin_step "Writing OTA metadata"
+{
+	echo "kernel_size=$kernel_size"
+	echo "kernel_sha256=$kernel_hash"
+	echo "rootfs_size=$rootfs_size"
+	echo "rootfs_sha256=$rootfs_hash"
+} > "$stage_dir/.epass-update"
+begin_step "Syncing OTA staging files"
+sync || die "cannot sync staged update"
+
+begin_step "Committing OTA staging directory"
+rm -rf /data/ota
+mv "$stage_dir" /data/ota
+stage_dir=
+sync || die "cannot sync committed update"
+
+begin_step "Writing boot control record"
+epass-otactl request-update \
+	"$kernel_size" "$kernel_hash" "$rootfs_size" "$rootfs_hash"
+echo "Update ($targets) staged in /data/ota; reboot to let U-Boot install it"

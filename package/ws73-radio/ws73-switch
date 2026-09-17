@@ -28,19 +28,6 @@ stop_wifi()
 	unload_module wifi_soc
 }
 
-stop_ble()
-{
-	if ! is_loaded ble_soc; then
-		return
-	fi
-	if command -v btmgmt >/dev/null 2>&1; then
-		btmgmt power off >/dev/null 2>&1 || true
-	elif command -v bluetoothctl >/dev/null 2>&1; then
-		bluetoothctl power off >/dev/null 2>&1 || true
-	fi
-	unload_module ble_soc
-}
-
 check_mmc0_available()
 {
 	if grep -q '^/dev/mmcblk0' /proc/mounts; then
@@ -57,45 +44,20 @@ check_mmc0_available()
 
 usage()
 {
-	echo "Usage: ws73-switch {radio|wifi|ble|sle|sd|status}" >&2
+	echo "Usage: ws73-switch {wifi|sd|status}" >&2
 	exit 2
 }
 
 case "${1:-}" in
-radio)
-	check_mmc0_available
-	modprobe plat_soc
-	modprobe wifi_soc
-	modprobe ble_soc
-	modprobe sle_soc
-	;;
 wifi)
 	check_mmc0_available
-	unload_module sle_soc
-	stop_ble
 	modprobe plat_soc
 	modprobe wifi_soc
-	;;
-ble)
-	check_mmc0_available
-	unload_module sle_soc
-	stop_wifi
-	modprobe plat_soc
-	modprobe ble_soc
-	;;
-sle)
-	check_mmc0_available
-	stop_ble
-	stop_wifi
-	modprobe plat_soc
-	modprobe sle_soc
 	;;
 sd)
 	# BusyBox modprobe -r also tries to remove dependencies.  Removing a
 	# leaf therefore returns failure while plat_soc is still in use and,
 	# with set -e, aborts this sequence after the first module.
-	unload_module sle_soc
-	stop_ble
 	stop_wifi
 	unload_module plat_soc
 	;;
@@ -105,12 +67,8 @@ status)
 		[ -e "$device" ] && basename "$device"
 	done
 	echo "WS73 modules:"
-	grep -E '^(plat_soc|wifi_soc|ble_soc|sle_soc) ' /proc/modules || true
+	grep -E '^(plat_soc|wifi_soc) ' /proc/modules || true
 	ip link show wlan0 2>/dev/null || true
-	for device in /sys/class/bluetooth/hci*; do
-		[ -e "$device" ] && basename "$device"
-	done
-	[ -e /dev/hwsle ] && echo "/dev/hwsle"
 	;;
 *)
 	usage

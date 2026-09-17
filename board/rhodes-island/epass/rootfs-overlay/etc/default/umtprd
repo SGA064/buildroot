@@ -1,0 +1,4 @@
+# The MTP gadget is not created at boot. epass_app owns the display and the
+# USB mode is expected to be requested on demand, so S99epass-late skips
+# umtprd unless this is set to 1.
+UMTPRD_ENABLE=0

@@ -1,0 +1,60 @@
+#!/bin/sh
+
+DAEMON="seedrng"
+LOGFILE="/var/log/${DAEMON}.log"
+
+# SEED_DIR comes from /etc/default/seedrng.
+# shellcheck source=/dev/null
+[ ! -r "/etc/default/$DAEMON" ] || . "/etc/default/$DAEMON"
+
+run_seedrng()
+{
+	mountpoint -q /data || {
+		echo "data volume is not mounted" >&2
+		return 1
+	}
+	mkdir -p "$(dirname "$LOGFILE")"
+	seedrng --seed-dir="$SEED_DIR" >> "$LOGFILE" 2>&1
+}
+
+restore()
+{
+	printf 'Restoring random seed: '
+	if run_seedrng; then
+		echo "OK"
+	else
+		echo "FAIL"
+		return 1
+	fi
+}
+
+save()
+{
+	printf 'Saving random seed: '
+	if ! mountpoint -q /data; then
+		echo "SKIP (/data is not mounted)"
+		return 0
+	fi
+	if run_seedrng; then
+		echo "OK"
+	else
+		echo "FAIL"
+		return 1
+	fi
+}
+
+case "$1" in
+start|restore)
+	restore
+	;;
+stop)
+	save
+	;;
+restart|reload)
+	restore
+	;;
+*)
+	echo "Usage: $0 {start|restore|stop|restart|reload}" >&2
+	exit 1
+	;;
+esac
